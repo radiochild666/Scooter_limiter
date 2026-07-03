@@ -80,7 +80,6 @@ void loop() {
     bool     fresh    = rpm_new_sample;
     rpm_new_sample    = false;
     interrupts();
-    int throttleInValue = analogRead(A0);
     
 if (fresh && interval > 0) {
        // one tick = 1/RPM_DIVISOR rev; 60e6 us per minute
@@ -90,6 +89,7 @@ speed_kmh = rpm * WHEEL_CIRCUMFERENCE_M * 60.0f / 1000.0f;
         last_sample_ms = millis();
     }
     else if (millis() - last_sample_ms > RPM_TIMEOUT_MS) {
+        speed_kmh = 0;
         rpm = 0.0f;
     }
 /*    if (fresh && interval > 0) {
@@ -117,4 +117,7 @@ speed_kmh = rpm * WHEEL_CIRCUMFERENCE_M * 60.0f / 1000.0f;
     display.print("RPM: ");
     display.print(rpm);
     display.display();
+    int throttleIn = analogRead(A0);
+    throttleOut = map(throttleIn, 0, 1023, 0, 255);
+    analogWrite(5, throttleOut);
 }

@@ -1,0 +1,231 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------------------------------------------------------------------------
+//  Scooter speed limiter  —  Arduino Uno prototype (ATtiny later, see notes)
+//  Wheel: 125 mm RADIUS (incl. tire) -> 250 mm diameter
+//
+//  Technique: low-select "override governor".
+//      outputPWM = min( riderThrottle , governorCap )
+//  A PI loop with setpoint = SPEED_LIMIT_KMH computes governorCap. Below the
+//  limit the rider always asks for less than the cap, so the thumb throttle
+//  passes straight through and feels organic; the loop only bites near 25 km/h.
+//
+//  Anti-windup: CONDITIONAL INTEGRATION against the cap's own 0..255 range.
+//  While below the limit the integrator pins the cap at 255 (rider fully free,
+//  organic launch). The cap only drops once speed crosses the limit. (Do NOT
+//  drag the integrator toward the low-selected output — that stalls launch.)
+//
+//  D term intentionally omitted: RPM-derived speed is noisy and D would inject
+//  that noise straight into the PWM. Add a *filtered* D only if PI won't settle.
+// ---------------------------------------------------------------------------
+
+// ----- Display -----
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    4
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ----- Pins (Uno) -----
+#define RPM_PIN          2      // external-interrupt pin (Uno: 2 or 3 only)
+#define THROTTLE_IN_PIN  A0     // analog thumb throttle
+#define THROTTLE_OUT_PIN 5      // PWM to motor stage (Uno PWM pin)
+#define LED_PIN          13     // lights when governor is actively limiting
+
+// ----- Wheel / speed -----
+#define WHEEL_DIAMETER_M       (0.250f)                  // <-- no trailing ';'
+#define WHEEL_CIRCUMFERENCE_M  (3.14159265f * WHEEL_DIAMETER_M)
+#define RPM_DIVISOR            30      // sensor ticks per wheel revolution
+#define RPM_TIMEOUT_MS         250     // no ticks for this long => speed = 0
+#define SPEED_LIMIT_KMH        25.0f
+
+// ----- Throttle scaling (Uno: 10-bit ADC in, 8-bit PWM out) -----
+#define ADC_MAX  1023
+#define PWM_MIN  0
+#define PWM_MAX  255
+
+// ----- Governor (PI) gains — TUNE ON THE BENCH -----
+float Kp = 6.0f;
+float Ki = 12.0f;
+float govIntegral = 0.0f;
+
+// ----- Approach taper --------------------------------------------------------
+// A speed-based throttle ceiling that starts easing BEFORE the limit, so the
+// motor isn't at full drive at the moment of crossing 25 (that's what feeds the
+// overshoot). Ceiling ramps linearly from PWM_MAX at *_START_KMH down to *_FLOOR
+// at the limit; the PI still handles steady holding and cutting above 25.
+//
+// Pick ONE profile. LOW = gentle (keeps punch late, less overshoot reduction),
+// HIGH = aggressive (smoothest/tightest, but softer power earlier).
+#define TAPER_PROFILE_LOW      // <-- LOW | MEDIUM | HIGH
+
+#if defined(TAPER_PROFILE_LOW)
+  #define TAPER_START_KMH  23.0f  // start easing here
+  #define TAPER_FLOOR      120    // PWM ceiling remaining at the limit
+#elif defined(TAPER_PROFILE_MEDIUM)
+  #define TAPER_START_KMH  22.0f
+  #define TAPER_FLOOR      100
+#elif defined(TAPER_PROFILE_HIGH)
+  #define TAPER_START_KMH  20.0f
+  #define TAPER_FLOOR      80
+#else
+  #error "Select a taper profile: LOW, MEDIUM, or HIGH"
+#endif
+
+// ----- Loop cadence -----
+#define CONTROL_MS 20      // 50 Hz control loop
+#define DISPLAY_MS 150     // OLED refresh (display.display() is slow over I2C)
+uint32_t lastControlMs = 0;
+uint32_t lastDisplayMs = 0;
+
+// ----- Speed state -----
+static float    speed_kmh      = 0.0f;
+static float    rpm            = 0.0f;
+static uint32_t last_sample_ms = 0;
+
+// ----- Output / status -----
+int  throttleOut = 0;        // last value sent to the motor stage
+bool limiting    = false;    // true when governor is cutting the rider's request
+
+// ----- ISR-shared -----
+static volatile uint32_t rpm_end_ts      = 0;
+volatile uint32_t        rpm_interval_us = 0;
+volatile bool            rpm_new_sample  = false;
+volatile unsigned long   rpm_ticks       = 0;   // debug counter
+
+static void rpm_tick_handler() {
+    uint32_t now = micros();
+    rpm_interval_us = now - rpm_end_ts;   // unsigned subtraction: rollover-safe
+    rpm_end_ts = now;
+    rpm_ticks++;                          // was: rpm_ticks = rpm_time_ts + 1 (bug)
+    rpm_new_sample = true;
+}
+
+void setup() {
+    Serial.begin(9600);
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println(F("SSD1306 allocation failed"));
+        for (;;);
+    }
+
+    pinMode(RPM_PIN, INPUT_PULLUP);
+    pinMode(THROTTLE_OUT_PIN, OUTPUT);
+    pinMode(LED_PIN, OUTPUT);
+
+    rpm_end_ts     = micros();
+    uint32_t t0    = millis();
+    last_sample_ms = t0;
+    lastControlMs  = t0;
+    lastDisplayMs  = t0;
+
+    attachInterrupt(digitalPinToInterrupt(RPM_PIN), rpm_tick_handler, CHANGE);
+
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(WHITE);
+    display.setCursor(25, 10); display.println(F("Scooter"));
+    display.setCursor(25, 35); display.println(F("Limiter"));
+    display.display();
+    delay(1000);
+    display.clearDisplay();
+    display.display();
+
+    Serial.println(F("Limiter started"));
+}
+
+// Pull the freshest interval from the ISR and convert to km/h.
+void updateSpeed() {
+    noInterrupts();
+    uint32_t interval = rpm_interval_us;
+    bool     fresh    = rpm_new_sample;
+    rpm_new_sample    = false;
+    interrupts();
+
+    if (fresh && interval > 0) {
+        rpm       = 60000000.0f / ((float)interval * RPM_DIVISOR);   // rev/min
+        speed_kmh = rpm * WHEEL_CIRCUMFERENCE_M * 60.0f / 1000.0f;   // km/h
+        last_sample_ms = millis();
+    } else if (millis() - last_sample_ms > RPM_TIMEOUT_MS) {
+        rpm       = 0.0f;
+        speed_kmh = 0.0f;
+    }
+}
+
+// Speed-based throttle ceiling: PWM_MAX below the zone, linearly down to
+// TAPER_FLOOR at the limit. Above the limit the PI takes over the cutting.
+int taperCeiling(float speed) {
+    if (speed <= TAPER_START_KMH) return PWM_MAX;
+    if (speed >= SPEED_LIMIT_KMH)  return TAPER_FLOOR;
+    float frac = (speed - TAPER_START_KMH) / (SPEED_LIMIT_KMH - TAPER_START_KMH);
+    return (int)(PWM_MAX - frac * (PWM_MAX - TAPER_FLOOR));
+}
+
+// PI governor + low-select override. Called at the control rate.
+void runGovernor(float dt) {
+    // Rider intent -> desired PWM
+    int riderPWM = map(analogRead(THROTTLE_IN_PIN), 0, ADC_MAX, PWM_MIN, PWM_MAX);
+    riderPWM = constrain(riderPWM, PWM_MIN, PWM_MAX);
+
+    // PI cap: setpoint is the speed limit
+    float error     = SPEED_LIMIT_KMH - speed_kmh;
+    float candidate = Kp * error + govIntegral;
+    float govPWM    = constrain(candidate, (float)PWM_MIN, (float)PWM_MAX);
+
+    // Conditional-integration anti-windup:
+    //   freeze the integrator only when the cap is saturated AND the error
+    //   would push it further into saturation. Below the limit this parks the
+    //   cap at 255 (rider fully free); it releases the instant error flips.
+    bool satHigh = (candidate > PWM_MAX) && (error > 0.0f);
+    bool satLow  = (candidate < PWM_MIN) && (error < 0.0f);
+    if (!satHigh && !satLow) {
+        govIntegral += Ki * error * dt;
+    }
+    govIntegral = constrain(govIntegral, -50.0f, (float)PWM_MAX + 50.0f); // safety net
+
+    // Low-select: whichever asks for the least wins —
+    //   rider intent, PI governor cap, or the pre-limit approach taper.
+    throttleOut = min(riderPWM, (int)govPWM);
+    throttleOut = min(throttleOut, taperCeiling(speed_kmh));
+    analogWrite(THROTTLE_OUT_PIN, throttleOut);
+
+    limiting = (throttleOut < riderPWM);
+    digitalWrite(LED_PIN, limiting ? HIGH : LOW);
+}
+
+void updateDisplay() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(1, 5);
+    display.print(F("Speed: ")); display.print(speed_kmh, 1); display.print(F(" km/h"));
+    display.setCursor(1, 25);
+    display.print(F("RPM:   ")); display.print(rpm, 0);
+    display.setCursor(1, 45);
+    display.print(F("PWM:   ")); display.print(throttleOut);
+    if (limiting) display.print(F("  LIM"));
+    display.display();
+}
+
+void loop() {
+    uint32_t now = millis();
+
+    updateSpeed();   // cheap; run every pass so the control tick sees a fresh sample
+
+    if (now - lastControlMs >= CONTROL_MS) {
+        float dt = (now - lastControlMs) / 1000.0f;
+        lastControlMs = now;
+        runGovernor(dt);
+    }
+
+    if (now - lastDisplayMs >= DISPLAY_MS) {
+        lastDisplayMs = now;
+        updateDisplay();
+        Serial.print(F("v=")); Serial.print(speed_kmh, 1);
+        Serial.print(F(" rpm=")); Serial.print(rpm, 0);
+        Serial.print(F(" pwm=")); Serial.print(throttleOut);
+        Serial.print(F(" lim=")); Serial.println(limiting);
+    }
+}
